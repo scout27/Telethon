@@ -425,6 +425,60 @@ class DownloadMethods:
             return await self._download_web_document(
                 media, file, progress_callback
             )
+    
+    async def download_media_gen(
+            self: 'TelegramClient',
+            message: 'hints.MessageLike',
+            file: 'hints.FileLike' = None,
+            *,
+            thumb: 'typing.Union[int, types.TypePhotoSize]' = None,
+            progress_callback: 'hints.ProgressCallback' = None) -> typing.Optional[typing.Union[str, bytes]]:
+
+        msg_data = None
+
+        if isinstance(message, types.Message):
+            date = message.date
+            media = message.media
+            msg_data = (message.input_chat, message.id) if message.input_chat else None
+        else:
+            date = datetime.datetime.now()
+            media = message
+
+        if isinstance(media, str):
+            media = utils.resolve_bot_file_id(media)
+
+        if isinstance(media, types.MessageService):
+            if isinstance(message.action,
+                          types.MessageActionChatEditPhoto):
+                media = media.photo
+
+        if isinstance(media, types.MessageMediaWebPage):
+            if isinstance(media.webpage, types.WebPage):
+                media = media.webpage.document or media.webpage.photo
+
+        if isinstance(media, (types.MessageMediaPhoto, types.Photo)):
+            yield self._download_photo(
+                media, file, date, thumb, progress_callback
+            )
+        elif isinstance(media, (types.MessageMediaDocument, types.Document)):
+            gen = self._download_document_gen(
+                media, file, date, thumb, progress_callback, msg_data
+            )
+            while True:
+                try:
+                    data = await gen.__anext__()
+                    yield data
+                except StopAsyncIteration:
+                    break
+        elif isinstance(media, types.MessageMediaContact) and thumb is None:
+            yield self._download_contact(
+                media, file
+            )
+        elif isinstance(media, (types.WebDocument, types.WebDocumentNoProxy)) and thumb is None:
+            yield self._download_web_document(
+                media, file, progress_callback
+            )
+
 
     async def download_file(
             self: 'TelegramClient',
@@ -556,6 +610,52 @@ class DownloadMethods:
 
             if in_memory:
                 return f.getvalue()
+        finally:
+            if isinstance(file, str) or in_memory:
+                f.close()
+    
+    async def proxy_file(
+            self: 'TelegramClient',
+            input_location: 'hints.FileLike',
+            file: 'hints.OutFileLike' = None,
+            *,
+            part_size_kb: float = None,
+            file_size: int = None,
+            progress_callback: 'hints.ProgressCallback' = None,
+            dc_id: int = None,
+            key: bytes = None,
+            iv: bytes = None,
+            msg_data: tuple = None) -> typing.Optional[bytes]:
+        if not part_size_kb:
+            if not file_size:
+                part_size_kb = 64  # Reasonable default
+            else:
+                part_size_kb = utils.get_appropriated_part_size(file_size)
+
+        part_size = int(part_size_kb * 1024)
+        if part_size % MIN_CHUNK_SIZE != 0:
+            raise ValueError(
+                'The part size must be evenly divisible by 4096.')
+
+        if isinstance(file, pathlib.Path):
+            file = str(file.absolute())
+
+        try:
+            async for chunk in self._iter_download(
+                    input_location, request_size=part_size, dc_id=dc_id, msg_data=msg_data):
+                if iv and key:
+                    chunk = AES.decrypt_ige(chunk, key, iv)
+                f = io.BytesIO()
+                r = f.write(chunk)
+                if inspect.isawaitable(r):
+                    await r
+
+                if progress_callback:
+                    r = progress_callback(f.tell(), file_size)
+                    if inspect.isawaitable(r):
+                        await r
+                yield f.getvalue()
+                f.close()
         finally:
             if isinstance(file, str) or in_memory:
                 f.close()
@@ -895,6 +995,44 @@ class DownloadMethods:
         )
 
         return result if file is bytes else file
+    
+    async def _download_document_gen(
+            self, document, file, date, thumb, progress_callback, msg_data):
+        """Specialized Asyncgenerator version of .download_media_gen() for documents."""
+        if isinstance(document, types.MessageMediaDocument):
+            document = document.document
+        if not isinstance(document, types.Document):
+            return
+
+        if thumb is None:
+            kind, possible_names = self._get_kind_and_names(document.attributes)
+            file = self._get_proper_filename(
+                file, kind, utils.get_extension(document),
+                date=date, possible_names=possible_names
+            )
+            size = None
+        else:
+            file = self._get_proper_filename(file, 'photo', '.jpg', date=date)
+            size = self._get_thumb(document.thumbs, thumb)
+
+        result = self.proxy_file(
+            types.InputDocumentFileLocation(
+                id=document.id,
+                access_hash=document.access_hash,
+                file_reference=document.file_reference,
+                thumb_size=size.type if size else ''
+            ),
+            file,
+            file_size=size.size if size else document.size,
+            progress_callback=progress_callback,
+            msg_data=msg_data,
+        )
+        while True:
+            try:
+                data = await result.__anext__()
+                yield data
+            except StopAsyncIteration:
+                break
 
     @classmethod
     def _download_contact(cls, mm_contact, file):
